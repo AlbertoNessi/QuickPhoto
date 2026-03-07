@@ -1,0 +1,19 @@
+#!/bin/zsh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC="$SCRIPT_DIR/Sources/QPHotkey/main.m"
+BIN="$SCRIPT_DIR/.build/qp-hotkey"
+
+mkdir -p "$SCRIPT_DIR/.build"
+
+if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
+  clang -fobjc-arc \
+    "$SRC" \
+    -o "$BIN" \
+    -framework Foundation \
+    -framework AppKit \
+    -framework Carbon
+fi
+
+exec "$BIN" --qp-path "$SCRIPT_DIR/qp" "$@"

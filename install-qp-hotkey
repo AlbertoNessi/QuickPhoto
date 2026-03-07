@@ -1,0 +1,45 @@
+#!/bin/zsh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+LOG_DIR="$HOME/Library/Logs"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/com.quickphoto.hotkey.plist"
+LABEL="com.quickphoto.hotkey"
+UID="$(id -u)"
+
+mkdir -p "$LAUNCH_AGENTS_DIR" "$LOG_DIR"
+
+cat > "$PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SCRIPT_DIR/qp-hotkey</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$SCRIPT_DIR</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$LOG_DIR/com.quickphoto.hotkey.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_DIR/com.quickphoto.hotkey.err.log</string>
+</dict>
+</plist>
+EOF
+
+launchctl bootout "gui/$UID" "$PLIST_PATH" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$UID" "$PLIST_PATH"
+launchctl enable "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+launchctl kickstart -k "gui/$UID/$LABEL"
+
+echo "Installed QuickPhoto hotkey daemon."
+echo "Shortcut: Option + Space"
+echo "Logs: $LOG_DIR/com.quickphoto.hotkey.out.log and $LOG_DIR/com.quickphoto.hotkey.err.log"
