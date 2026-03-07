@@ -4,6 +4,8 @@ QuickPhoto is a native macOS tool that captures one photo from your MacBook buil
 
 No third-party dependencies are used. It is built with Apple frameworks only (`AppKit`, `AVFoundation`, `CoreImage`, `Carbon`).
 
+This project was fully developed by Codex with my supervision.
+
 ## Main features
 
 - One-shot capture to clipboard
