@@ -1,9 +1,14 @@
 #import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <Carbon/Carbon.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <IOKit/audio/IOAudioTypes.h>
+
+@class QPPreviewCoordinator;
+static void QPWarmUpCaptureSession(AVCaptureSession *session);
+static void QPWarmUpAutoExposure(AVCaptureDevice *device);
 
 @interface QPVideoFrameCaptureDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property(nonatomic, strong) NSData *jpegData;
@@ -11,6 +16,34 @@
 @property(nonatomic, assign) BOOL finished;
 @property(nonatomic, assign) NSInteger processedFrames;
 @property(nonatomic, strong) CIContext *ciContext;
+@property(nonatomic, assign) BOOL captureRequested;
+@property(nonatomic, copy) void (^completionHandler)(void);
+- (void)requestCapture;
+- (void)cancelCapture;
+@end
+
+@interface QPPreviewVideoView : NSView
+@property(nonatomic, strong) AVCaptureVideoPreviewLayer *previewLayer;
+@property(nonatomic, weak) QPPreviewCoordinator *coordinator;
+@end
+
+@interface QPPreviewCoordinator : NSObject <NSWindowDelegate>
+@property(nonatomic, strong) AVCaptureDevice *device;
+@property(nonatomic, strong) AVCaptureSession *session;
+@property(nonatomic, strong) AVCaptureDeviceInput *input;
+@property(nonatomic, strong) AVCaptureVideoDataOutput *videoOutput;
+@property(nonatomic, strong) dispatch_queue_t frameQueue;
+@property(nonatomic, strong) QPVideoFrameCaptureDelegate *captureDelegate;
+@property(nonatomic, strong) NSWindow *window;
+@property(nonatomic, strong) NSTextField *statusLabel;
+@property(nonatomic, strong) NSButton *captureButton;
+@property(nonatomic, strong) NSButton *cancelButton;
+- (instancetype)initWithDevice:(AVCaptureDevice *)device;
+- (BOOL)prepareSession:(NSError **)errorOut;
+- (NSData *)runHeadlessCaptureWithError:(NSError **)errorOut;
+- (NSData *)runPreviewCaptureWithError:(NSError **)errorOut;
+- (void)requestCapture;
+- (void)cancelCapture;
 @end
 
 @implementation QPVideoFrameCaptureDelegate
@@ -31,6 +64,9 @@
   }
   self.captureError = error;
   self.finished = YES;
+  if (self.completionHandler != nil) {
+    dispatch_async(dispatch_get_main_queue(), self.completionHandler);
+  }
 }
 
 - (void)finishWithJPEG:(NSData *)jpegData {
@@ -39,6 +75,21 @@
   }
   self.jpegData = jpegData;
   self.finished = YES;
+  if (self.completionHandler != nil) {
+    dispatch_async(dispatch_get_main_queue(), self.completionHandler);
+  }
+}
+
+- (void)requestCapture {
+  self.captureRequested = YES;
+}
+
+- (void)cancelCapture {
+  [self finishWithError:[NSError errorWithDomain:@"QuickPhoto"
+                                            code:1013
+                                        userInfo:@{
+                                          NSLocalizedDescriptionKey : @"Capture cancelled."
+                                        }]];
 }
 
 - (double)meanLumaForImage:(CIImage *)image {
@@ -93,6 +144,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     return;
   }
 
+  if (!self.captureRequested) {
+    return;
+  }
+
   CGImageRef cgImage = [self.ciContext createCGImage:ciImage fromRect:ciImage.extent];
   if (cgImage == nil) {
     [self finishWithError:[NSError errorWithDomain:@"QuickPhoto"
@@ -130,21 +185,281 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
 @end
 
+@implementation QPPreviewVideoView
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+  self = [super initWithFrame:frameRect];
+  if (self) {
+    self.wantsLayer = YES;
+  }
+  return self;
+}
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (void)setPreviewLayer:(AVCaptureVideoPreviewLayer *)previewLayer {
+  _previewLayer = previewLayer;
+  self.layer = previewLayer;
+}
+
+- (void)keyDown:(NSEvent *)event {
+  switch (event.keyCode) {
+  case kVK_Space:
+  case kVK_Return:
+  case kVK_ANSI_KeypadEnter:
+    [self.coordinator requestCapture];
+    return;
+  case kVK_Escape:
+    [self.coordinator cancelCapture];
+    return;
+  default:
+    [super keyDown:event];
+    return;
+  }
+}
+
+@end
+
+@implementation QPPreviewCoordinator
+
+- (instancetype)initWithDevice:(AVCaptureDevice *)device {
+  self = [super init];
+  if (self) {
+    _device = device;
+  }
+  return self;
+}
+
+- (BOOL)prepareSession:(NSError **)errorOut {
+  NSError *localError = nil;
+  if ([self.device lockForConfiguration:&localError]) {
+    if ([self.device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+      self.device.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+    }
+    if ([self.device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+      self.device.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+    }
+    [self.device unlockForConfiguration];
+  }
+
+  self.input = [AVCaptureDeviceInput deviceInputWithDevice:self.device error:&localError];
+  if (self.input == nil) {
+    if (errorOut != NULL) {
+      *errorOut = localError;
+    }
+    return NO;
+  }
+
+  self.session = [[AVCaptureSession alloc] init];
+  self.session.sessionPreset = AVCaptureSessionPresetPhoto;
+
+  self.videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+  self.videoOutput.alwaysDiscardsLateVideoFrames = YES;
+  self.videoOutput.videoSettings = @{
+    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)
+  };
+
+  if (![self.session canAddInput:self.input] || ![self.session canAddOutput:self.videoOutput]) {
+    if (errorOut != NULL) {
+      *errorOut = [NSError errorWithDomain:@"QuickPhoto"
+                                      code:1007
+                                  userInfo:@{
+                                    NSLocalizedDescriptionKey : @"Failed to configure camera capture session."
+                                  }];
+    }
+    return NO;
+  }
+
+  [self.session addInput:self.input];
+  [self.session addOutput:self.videoOutput];
+
+  self.frameQueue = dispatch_queue_create("qp.video.frame", DISPATCH_QUEUE_SERIAL);
+  self.captureDelegate = [[QPVideoFrameCaptureDelegate alloc] init];
+  [self.videoOutput setSampleBufferDelegate:self.captureDelegate queue:self.frameQueue];
+
+  AVCaptureConnection *videoConnection = [self.videoOutput connectionWithMediaType:AVMediaTypeVideo];
+  if (videoConnection != nil && videoConnection.isVideoMirroringSupported &&
+      self.device.position == AVCaptureDevicePositionFront) {
+    videoConnection.videoMirrored = YES;
+  }
+
+  return YES;
+}
+
+- (void)startSession {
+  [self.session startRunning];
+  QPWarmUpCaptureSession(self.session);
+  QPWarmUpAutoExposure(self.device);
+}
+
+- (void)stopSession {
+  [self.videoOutput setSampleBufferDelegate:nil queue:NULL];
+  [self.session stopRunning];
+}
+
+- (void)requestCapture {
+  self.captureButton.enabled = NO;
+  self.statusLabel.stringValue = @"Capturing...";
+  [self.captureDelegate requestCapture];
+}
+
+- (void)cancelCapture {
+  [self.captureDelegate cancelCapture];
+}
+
+- (void)closePreviewWindow {
+  [self.window orderOut:nil];
+  [self.window close];
+  self.window = nil;
+}
+
+- (void)buildPreviewWindow {
+  NSRect frame = NSMakeRect(0, 0, 920, 640);
+  self.window = [[NSWindow alloc] initWithContentRect:frame
+                                            styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                              backing:NSBackingStoreBuffered
+                                                defer:NO];
+  self.window.title = @"QuickPhoto Preview";
+  self.window.delegate = self;
+  [self.window center];
+
+  NSView *contentView = [[NSView alloc] initWithFrame:frame];
+  self.window.contentView = contentView;
+
+  QPPreviewVideoView *previewView = [[QPPreviewVideoView alloc] initWithFrame:NSMakeRect(20, 80, 880, 520)];
+  previewView.coordinator = self;
+  AVCaptureVideoPreviewLayer *previewLayer = [AVCaptureVideoPreviewLayer layerWithSession:self.session];
+  previewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+  previewView.previewLayer = previewLayer;
+  [contentView addSubview:previewView];
+
+  self.statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 28, 520, 24)];
+  self.statusLabel.editable = NO;
+  self.statusLabel.bezeled = NO;
+  self.statusLabel.drawsBackground = NO;
+  self.statusLabel.selectable = NO;
+  self.statusLabel.stringValue = @"Space/Return to capture, Esc to cancel.";
+  [contentView addSubview:self.statusLabel];
+
+  self.captureButton = [[NSButton alloc] initWithFrame:NSMakeRect(700, 20, 96, 32)];
+  self.captureButton.title = @"Capture";
+  self.captureButton.bezelStyle = NSBezelStyleRounded;
+  self.captureButton.target = self;
+  self.captureButton.action = @selector(requestCapture);
+  [contentView addSubview:self.captureButton];
+
+  self.cancelButton = [[NSButton alloc] initWithFrame:NSMakeRect(804, 20, 96, 32)];
+  self.cancelButton.title = @"Cancel";
+  self.cancelButton.bezelStyle = NSBezelStyleRounded;
+  self.cancelButton.target = self;
+  self.cancelButton.action = @selector(cancelCapture);
+  [contentView addSubview:self.cancelButton];
+
+  [self.window makeFirstResponder:previewView];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+  if (!self.captureDelegate.finished) {
+    [self cancelCapture];
+  }
+}
+
+- (NSData *)finalizeCaptureWithError:(NSError **)errorOut {
+  [self stopSession];
+
+  if (self.captureDelegate.captureError != nil) {
+    if (errorOut != NULL) {
+      *errorOut = self.captureDelegate.captureError;
+    }
+    return nil;
+  }
+
+  if (self.captureDelegate.jpegData == nil) {
+    if (errorOut != NULL) {
+      *errorOut = [NSError errorWithDomain:@"QuickPhoto"
+                                      code:1012
+                                  userInfo:@{
+                                    NSLocalizedDescriptionKey : @"Capture completed without a valid frame."
+                                  }];
+    }
+    return nil;
+  }
+
+  return self.captureDelegate.jpegData;
+}
+
+- (NSData *)runHeadlessCaptureWithError:(NSError **)errorOut {
+  __weak typeof(self) weakSelf = self;
+  self.captureDelegate.completionHandler = ^{
+    // Headless mode polls its own run loop; completion is used to wake the main queue quickly.
+    (void)weakSelf;
+  };
+
+  [self startSession];
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
+  while (!self.captureDelegate.finished && [deadline timeIntervalSinceNow] > 0) {
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    if (!self.captureDelegate.captureRequested && self.captureDelegate.processedFrames >= 6) {
+      [self.captureDelegate requestCapture];
+    }
+  }
+
+  if (!self.captureDelegate.finished) {
+    if (errorOut != NULL) {
+      *errorOut = [NSError errorWithDomain:@"QuickPhoto"
+                                      code:1008
+                                  userInfo:@{
+                                    NSLocalizedDescriptionKey : @"Capture timed out."
+                                  }];
+    }
+    [self stopSession];
+    return nil;
+  }
+
+  return [self finalizeCaptureWithError:errorOut];
+}
+
+- (NSData *)runPreviewCaptureWithError:(NSError **)errorOut {
+  NSApplication *app = [NSApplication sharedApplication];
+  [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+
+  __weak typeof(self) weakSelf = self;
+  self.captureDelegate.completionHandler = ^{
+    [NSApp stop:nil];
+    [weakSelf closePreviewWindow];
+  };
+
+  [self buildPreviewWindow];
+  [self startSession];
+  [self.window makeKeyAndOrderFront:nil];
+  [app activateIgnoringOtherApps:YES];
+  [app run];
+
+  return [self finalizeCaptureWithError:errorOut];
+}
+
+@end
+
 static void QPPrintUsage(void) {
   printf("QuickPhoto (QP)\n");
-  printf("Usage: qp [--delay <seconds>] [--save <path>] [--camera-list] [--help]\n");
+  printf("Usage: qp [--delay <seconds>] [--save <path>] [--camera-list] [--headless] [--help]\n");
   printf("  --delay <seconds>   Wait before capture\n");
   printf("  --save <path>       Save captured JPEG to file for diagnostics\n");
   printf("  --camera-list       List video devices and selected built-in camera\n");
+  printf("  --headless          Capture immediately without opening preview window\n");
   printf("  --help              Show help\n");
 }
 
 static BOOL QPParseArgs(int argc, const char *argv[], int *delayOut, NSString **savePathOut,
-                        BOOL *cameraListOut,
+                        BOOL *cameraListOut, BOOL *headlessOut,
                         NSError **errorOut) {
   int delay = 0;
   NSString *savePath = nil;
   BOOL cameraList = NO;
+  BOOL headless = NO;
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
     if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
@@ -154,6 +469,11 @@ static BOOL QPParseArgs(int argc, const char *argv[], int *delayOut, NSString **
 
     if (strcmp(arg, "--camera-list") == 0) {
       cameraList = YES;
+      continue;
+    }
+
+    if (strcmp(arg, "--headless") == 0) {
+      headless = YES;
       continue;
     }
 
@@ -215,6 +535,7 @@ static BOOL QPParseArgs(int argc, const char *argv[], int *delayOut, NSString **
   *delayOut = delay;
   *savePathOut = savePath;
   *cameraListOut = cameraList;
+  *headlessOut = headless;
   return YES;
 }
 
@@ -384,7 +705,7 @@ static void QPWarmUpAutoExposure(AVCaptureDevice *device) {
   }
 }
 
-static NSData *QPCapturePhotoData(NSError **errorOut) {
+static NSData *QPCapturePhotoData(BOOL headless, NSError **errorOut) {
   if (!QPEnsureCameraPermission(errorOut)) {
     return nil;
   }
@@ -403,101 +724,15 @@ static NSData *QPCapturePhotoData(NSError **errorOut) {
   }
   printf("Using built-in camera: %s\n", device.localizedName.UTF8String);
 
-  NSError *localError = nil;
-  if ([device lockForConfiguration:&localError]) {
-    if ([device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
-      device.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
-    }
-    if ([device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
-      device.focusMode = AVCaptureFocusModeContinuousAutoFocus;
-    }
-    [device unlockForConfiguration];
-  }
-
-  AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&localError];
-  if (input == nil) {
-    if (errorOut != NULL) {
-      *errorOut = localError;
-    }
+  QPPreviewCoordinator *coordinator = [[QPPreviewCoordinator alloc] initWithDevice:device];
+  if (![coordinator prepareSession:errorOut]) {
     return nil;
   }
 
-  AVCaptureSession *session = [[AVCaptureSession alloc] init];
-  session.sessionPreset = AVCaptureSessionPresetPhoto;
-
-  AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
-  videoOutput.alwaysDiscardsLateVideoFrames = YES;
-  videoOutput.videoSettings = @{
-    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)
-  };
-
-  if (![session canAddInput:input] || ![session canAddOutput:videoOutput]) {
-    if (errorOut != NULL) {
-      *errorOut = [NSError errorWithDomain:@"QuickPhoto"
-                                      code:1007
-                                  userInfo:@{
-                                    NSLocalizedDescriptionKey : @"Failed to configure camera capture session."
-                                  }];
-    }
-    return nil;
+  if (headless) {
+    return [coordinator runHeadlessCaptureWithError:errorOut];
   }
-
-  [session addInput:input];
-  [session addOutput:videoOutput];
-
-  dispatch_queue_t frameQueue = dispatch_queue_create("qp.video.frame", DISPATCH_QUEUE_SERIAL);
-  QPVideoFrameCaptureDelegate *delegate = [[QPVideoFrameCaptureDelegate alloc] init];
-  [videoOutput setSampleBufferDelegate:delegate queue:frameQueue];
-
-  AVCaptureConnection *videoConnection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
-  if (videoConnection != nil && videoConnection.isVideoMirroringSupported &&
-      device.position == AVCaptureDevicePositionFront) {
-    videoConnection.videoMirrored = YES;
-  }
-
-  [session startRunning];
-  QPWarmUpCaptureSession(session);
-  QPWarmUpAutoExposure(device);
-
-  // Keep the run loop alive so capture callbacks can fire even if AVFoundation uses this thread.
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
-  while (!delegate.finished && [deadline timeIntervalSinceNow] > 0) {
-    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-  }
-  [videoOutput setSampleBufferDelegate:nil queue:NULL];
-  [session stopRunning];
-
-  if (!delegate.finished) {
-    if (errorOut != NULL) {
-      *errorOut = [NSError errorWithDomain:@"QuickPhoto"
-                                      code:1008
-                                  userInfo:@{
-                                    NSLocalizedDescriptionKey : @"Capture timed out."
-                                  }];
-    }
-    return nil;
-  }
-
-  if (delegate.captureError != nil) {
-    if (errorOut != NULL) {
-      *errorOut = delegate.captureError;
-    }
-    return nil;
-  }
-
-  if (delegate.jpegData == nil) {
-    if (errorOut != NULL) {
-      *errorOut = [NSError errorWithDomain:@"QuickPhoto"
-                                      code:1012
-                                  userInfo:@{
-                                    NSLocalizedDescriptionKey : @"Capture completed without a valid frame."
-                                  }];
-    }
-    return nil;
-  }
-
-  return delegate.jpegData;
+  return [coordinator runPreviewCaptureWithError:errorOut];
 }
 
 static BOOL QPWriteImageToClipboard(NSData *photoData, NSError **errorOut) {
@@ -557,7 +792,8 @@ int main(int argc, const char *argv[]) {
     int delay = 0;
     NSString *savePath = nil;
     BOOL cameraList = NO;
-    if (!QPParseArgs(argc, argv, &delay, &savePath, &cameraList, &error)) {
+    BOOL headless = NO;
+    if (!QPParseArgs(argc, argv, &delay, &savePath, &cameraList, &headless, &error)) {
       fprintf(stderr, "QuickPhoto error: %s\n", error.localizedDescription.UTF8String);
       return 1;
     }
@@ -572,8 +808,12 @@ int main(int argc, const char *argv[]) {
       sleep(1);
     }
 
-    NSData *photoData = QPCapturePhotoData(&error);
+    NSData *photoData = QPCapturePhotoData(headless, &error);
     if (photoData == nil) {
+      if (error.code == 1013) {
+        fprintf(stderr, "QuickPhoto: capture cancelled.\n");
+        return 0;
+      }
       fprintf(stderr, "QuickPhoto error: %s\n", error.localizedDescription.UTF8String);
       return 1;
     }

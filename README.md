@@ -9,10 +9,12 @@ This project was fully developed by Codex with my supervision.
 ## Main features
 
 - One-shot capture to clipboard
+- Live preview window before capture
 - Built-in camera selection (ignores external camera devices)
 - Optional countdown (`--delay`)
 - Optional save to JPEG for diagnostics (`--save`)
 - Camera diagnostics (`--camera-list`)
+- Headless capture mode for scripts/tests (`--headless`)
 - Global hotkey daemon (`Option + Space`)
 
 ## Requirements
@@ -43,6 +45,8 @@ cd /path/to/QuickPhoto
 ```
 
 `qp` compiles and runs the native Objective-C capture binary.
+By default it opens a preview window, shows the live built-in camera feed, and lets you capture with `Space` or `Return`.
+Press `Esc` to cancel.
 
 ## Recommended first verification
 
@@ -85,6 +89,12 @@ Save captured image:
 
 ```bash
 ./qp --save /tmp/qp-capture.jpg
+```
+
+Capture without opening the preview window:
+
+```bash
+./qp --headless
 ```
 
 Camera list and selected built-in camera:
